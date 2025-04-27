@@ -2,17 +2,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <omp.h>
-#include <math.h>
 
-#define N 1024
+#define N 1024 // Matrix dimension
 
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
+
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    // Verify N is divisible by size
     if (N % size != 0) {
         if (rank == 0)
             fprintf(stderr, "Matrix size %d must be divisible by number of processes %d\n", N, size);
@@ -22,12 +21,16 @@ int main(int argc, char** argv) {
 
     int rows_per_proc = N / size;
 
-    // Allocate memory for all processes
     float *A = (float*)malloc(rows_per_proc * N * sizeof(float));
     float *B = (float*)malloc(N * N * sizeof(float));
     float *C = (float*)malloc(rows_per_proc * N * sizeof(float));
 
-    // Initialize B matrix (identity) on root
+    if (!A || !B || !C) {
+        fprintf(stderr, "Rank %d: Memory allocation failed\n", rank);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    // Initialize B matrix (identity matrix) on root
     if (rank == 0) {
         for (int i = 0; i < N; i++) {
             for (int j = 0; j < N; j++) {
@@ -36,10 +39,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Initialize local A matrix (each process gets its own part)
+    // Initialize A matrix locally
     for (int i = 0; i < rows_per_proc; i++) {
         for (int j = 0; j < N; j++) {
-            A[i*N + j] = (rank * rows_per_proc + i) + j;
+            A[i*N + j] = (float)(rank * rows_per_proc + i + j);
         }
     }
 
@@ -48,7 +51,7 @@ int main(int argc, char** argv) {
 
     double start = MPI_Wtime();
 
-    // Parallel computation with OpenMP
+    // Matrix multiplication using OpenMP inside MPI process
     #pragma omp parallel for collapse(2)
     for (int i = 0; i < rows_per_proc; i++) {
         for (int j = 0; j < N; j++) {
@@ -62,21 +65,27 @@ int main(int argc, char** argv) {
 
     double end = MPI_Wtime();
 
-    // Gather results (only needed if root will use C)
+    // Gather results
     float *global_C = NULL;
     if (rank == 0) {
         global_C = (float*)malloc(N * N * sizeof(float));
     }
+
     MPI_Gather(C, rows_per_proc*N, MPI_FLOAT,
                global_C, rows_per_proc*N, MPI_FLOAT,
                0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        printf("Time: %.3fs\n", end - start);
+        printf("Matrix multiplication (%dx%d) with %d processes and OpenMP threads took %.4f seconds\n",
+               N, N, size, end - start);
         free(global_C);
     }
 
-    free(A); free(B); free(C);
+    free(A);
+    free(B);
+    free(C);
+
     MPI_Finalize();
     return 0;
 }
+
