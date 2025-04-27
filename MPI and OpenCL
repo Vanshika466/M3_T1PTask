@@ -1,0 +1,150 @@
+#include <mpi.h>
+#include <CL/cl.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#define N 1024
+#define KERNEL_CODE "\
+__kernel void matmul(__global float* A, __global float* B, __global float* C, int N, int rows_per_proc) { \
+    int row = get_global_id(0); \
+    int col = get_global_id(1); \
+    if (row < rows_per_proc && col < N) { \
+        float sum = 0.0f; \
+        for (int k = 0; k < N; k++) { \
+            sum += A[row * N + k] * B[k * N + col]; \
+        } \
+        C[row * N + col] = sum; \
+    } \
+}"
+
+void checkError(cl_int err, const char* operation) {
+    if (err != CL_SUCCESS) {
+        fprintf(stderr, "OpenCL Error during %s: %d\n", operation, err);
+        exit(1);
+    }
+}
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    if (N % size != 0) {
+        if (rank == 0)
+            fprintf(stderr, "Matrix size %d must be divisible by number of processes %d\n", N, size);
+        MPI_Finalize();
+        return 1;
+    }
+
+    int rows_per_proc = N / size;
+
+    float* A = (float*)malloc(rows_per_proc * N * sizeof(float));
+    float* B = (float*)malloc(N * N * sizeof(float));
+    float* C = (float*)malloc(rows_per_proc * N * sizeof(float));
+
+    if (rank == 0) {
+        // Initialize B (identity matrix)
+        for (int i = 0; i < N; i++) {
+            for (int j = 0; j < N; j++) {
+                B[i*N + j] = (i == j) ? 1.0f : 0.0f;
+            }
+        }
+    }
+
+    for (int i = 0; i < rows_per_proc; i++) {
+        for (int j = 0; j < N; j++) {
+            A[i*N + j] = (float)(rank * rows_per_proc + i + j);
+        }
+    }
+
+    MPI_Bcast(B, N*N, MPI_FLOAT, 0, MPI_COMM_WORLD);
+
+    cl_int err;
+    cl_platform_id platform;
+    cl_device_id device;
+    cl_context context;
+    cl_command_queue queue;
+    cl_program program;
+    cl_kernel kernel;
+
+    err = clGetPlatformIDs(1, &platform, NULL);
+    checkError(err, "clGetPlatformIDs");
+
+    err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, NULL);
+    checkError(err, "clGetDeviceIDs");
+
+    context = clCreateContext(NULL, 1, &device, NULL, NULL, &err);
+    checkError(err, "clCreateContext");
+
+    queue = clCreateCommandQueue(context, device, 0, &err);
+    checkError(err, "clCreateCommandQueue");
+
+    program = clCreateProgramWithSource(context, 1, (const char**)&KERNEL_CODE, NULL, &err);
+    checkError(err, "clCreateProgramWithSource");
+
+    err = clBuildProgram(program, 1, &device, NULL, NULL, NULL);
+    if (err != CL_SUCCESS) {
+        char buffer[2048];
+        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, sizeof(buffer), buffer, NULL);
+        fprintf(stderr, "OpenCL Build Error:\n%s\n", buffer);
+        exit(1);
+    }
+
+    kernel = clCreateKernel(program, "matmul", &err);
+    checkError(err, "clCreateKernel");
+
+    cl_mem bufA = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, rows_per_proc*N*sizeof(float), A, &err);
+    cl_mem bufB = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, N*N*sizeof(float), B, &err);
+    cl_mem bufC = clCreateBuffer(context, CL_MEM_WRITE_ONLY, rows_per_proc*N*sizeof(float), NULL, &err);
+
+    err  = clSetKernelArg(kernel, 0, sizeof(cl_mem), &bufA);
+    err |= clSetKernelArg(kernel, 1, sizeof(cl_mem), &bufB);
+    err |= clSetKernelArg(kernel, 2, sizeof(cl_mem), &bufC);
+    err |= clSetKernelArg(kernel, 3, sizeof(int), &N);
+    err |= clSetKernelArg(kernel, 4, sizeof(int), &rows_per_proc);
+    checkError(err, "clSetKernelArg");
+
+    size_t global[2] = {rows_per_proc, N};
+
+    double start = MPI_Wtime();
+
+    err = clEnqueueNDRangeKernel(queue, kernel, 2, NULL, global, NULL, 0, NULL, NULL);
+    checkError(err, "clEnqueueNDRangeKernel");
+
+    err = clEnqueueReadBuffer(queue, bufC, CL_TRUE, 0, rows_per_proc*N*sizeof(float), C, 0, NULL, NULL);
+    checkError(err, "clEnqueueReadBuffer");
+
+    double end = MPI_Wtime();
+
+    float* global_C = NULL;
+    if (rank == 0) {
+        global_C = (float*)malloc(N*N*sizeof(float));
+    }
+
+    MPI_Gather(C, rows_per_proc*N, MPI_FLOAT,
+               global_C, rows_per_proc*N, MPI_FLOAT,
+               0, MPI_COMM_WORLD);
+
+    if (rank == 0) {
+        printf("MPI + OpenCL Matrix Multiplication (%dx%d) with %d processes took %.4f seconds\n",
+               N, N, size, end - start);
+        free(global_C);
+    }
+
+    clReleaseMemObject(bufA);
+    clReleaseMemObject(bufB);
+    clReleaseMemObject(bufC);
+    clReleaseKernel(kernel);
+    clReleaseProgram(program);
+    clReleaseCommandQueue(queue);
+    clReleaseContext(context);
+
+    free(A);
+    free(B);
+    free(C);
+
+    MPI_Finalize();
+    return 0;
+}
